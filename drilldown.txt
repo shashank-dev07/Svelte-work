@@ -1,0 +1,534 @@
+/** A small badge that truncates long text */
+function Pill({ children, level, pillStyles, maxWidth = 'xs' }) {
+  const style = pillStyles[level] || 'border-gray-400 bg-gray-100 text-gray-800';
+  return (
+    <span
+      className={`
+        inline-block text-sm rounded-full px-2 py-1 border
+        ${style}
+        max-w-${maxWidth} whitespace-nowrap overflow-hidden truncate
+      `}
+    >
+      {children}
+    </span>
+  );
+}
+
+export function GeneralizedDrillDownTable({
+  data,
+  drillHierarchy = [],
+  leafGroupBy = null,
+  metricColumns = [],
+  computedColumns = [],
+  pillStyles = {},
+  icon,
+  columnLabels = {},
+  formatters = {},
+  autoComputeColumns = true,
+  grandTotalColumns = [], // NEW: Array of column names that should show grand totals
+  showGrandTotal = true,  // NEW: Whether to show grand total row at all
+  columnOrder = [],       // NEW: Array specifying the order of metric and computed columns
+  scoreColumn = 'score', // NEW: Column to base scoring on (customizable)
+}) {
+  // Get all available metric columns from data
+  const availableMetrics = React.useMemo(() => {
+    const allColumns = metricColumns.map(col =>
+      typeof col === 'string' ? col : col.key
+    ).filter(col => data.some(d => d[col] != null));
+    return allColumns;
+  }, [data, metricColumns]);
+
+  // Generate auto-computed columns for metrics not explicitly provided
+  const finalComputedColumns = React.useMemo(() => {
+    if (!autoComputeColumns) return computedColumns;
+
+    // Get explicitly provided computed column keys
+    const explicitComputedKeys = computedColumns.map(col => col.key);
+
+    // Create auto-computed columns for remaining metrics
+    const autoColumns = availableMetrics
+      .filter(metric => !explicitComputedKeys.includes(metric))
+      .map(metric => ({
+        key: metric,
+        label: columnLabels[metric] || metric.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
+        formula: metric,
+        isAutoComputed: true
+      }));
+
+    return [...computedColumns, ...autoColumns];
+  }, [computedColumns, availableMetrics, autoComputeColumns, columnLabels]);
+
+  // Helper to check if a column should show grand total
+  const shouldShowGrandTotal = (columnKey) => {
+    // If grandTotalColumns is empty, show totals for all columns (backward compatibility)
+    if (grandTotalColumns.length === 0) return true;
+    return grandTotalColumns.includes(columnKey);
+  };
+
+  // Helper to get header label
+  const labelFor = (key) => columnLabels[key] || key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+
+  // Helper to format values
+  const formatValue = (value, columnKey, item = null) => {
+    if (formatters[columnKey]) {
+      return typeof formatters[columnKey] === 'function'
+        ? formatters[columnKey](value, item)
+        : formatters[columnKey];
+    }
+    if (typeof value === 'number') {
+      return value.toLocaleString();
+    }
+    return value || '';
+  };
+
+  // Helper to compute derived values
+  const computeValue = (computedCol, item) => {
+    // For auto-computed columns, just return the aggregated value
+    if (computedCol.isAutoComputed) {
+      return item[computedCol.key] || 0;
+    }
+
+    if (computedCol.formula) {
+      try {
+        // If formula is a function, execute it with the item as parameter
+        if (typeof computedCol.formula === 'function') {
+          return computedCol.formula(item);
+        }
+
+        // String-based formula processing
+        let formula = computedCol.formula;
+
+        // Replace column references with actual values
+        Object.keys(item).forEach(key => {
+          const regex = new RegExp(`\\b${key}\\b`, 'g');
+          formula = formula.replace(regex, item[key] || 0);
+        });
+
+        // Basic math operations support
+        if (formula.includes('/')) {
+          const [numerator, denominator] = formula.split('/');
+          const result = parseFloat(numerator) / parseFloat(denominator);
+          return isNaN(result) ? 0 : result;
+        }
+        if (formula.includes('*')) {
+          const [a, b] = formula.split('*');
+          return parseFloat(a) * parseFloat(b);
+        }
+        if (formula.includes('+')) {
+          return formula.split('+').reduce((sum, val) => sum + parseFloat(val), 0);
+        }
+        if (formula.includes('-')) {
+          const [a, b] = formula.split('-');
+          return parseFloat(a) - parseFloat(b);
+        }
+
+        return parseFloat(formula) || 0;
+      } catch (e) {
+        return 0;
+      }
+    }
+    return item[computedCol.key] || 0;
+  };
+
+  // Build nested structure
+  const buildNested = React.useCallback(
+    (rows, level = 0, parentKey = '', parentVals = {}) => {
+      // If we've reached the end of drill hierarchy, group by leaf column
+      if (level >= drillHierarchy.length) {
+        if (!leafGroupBy) {
+          // No leaf grouping, return individual rows
+          return rows.map((item, i) => ({
+            ...parentVals,
+            ...item,
+            level,
+            key: `${parentKey}-leaf-${i}`,
+            isLeaf: true,
+          }));
+        }
+
+        // Group by leaf column
+        const groups = rows.reduce((acc, item) => {
+          const key = item[leafGroupBy] || '(blank)';
+          acc[key] = acc[key] || [];
+          acc[key].push(item);
+          return acc;
+        }, {});
+
+        return Object.entries(groups).map(([groupVal, items], i) => {
+          const aggregated = items.reduce((sum, item) => {
+            // Aggregate metric columns
+            availableMetrics.forEach(col => {
+              sum[col] = (sum[col] || 0) + (item[col] || 0);
+            });
+            return sum;
+          }, {});
+
+          // Compute derived columns
+          finalComputedColumns.forEach(computedCol => {
+            aggregated[computedCol.key] = computeValue(computedCol, aggregated);
+          });
+
+          return {
+            ...parentVals,
+            ...aggregated,
+            [leafGroupBy]: groupVal,
+            level,
+            key: `${parentKey}-leaf-${i}`,
+            isLeaf: true,
+          };
+        });
+      }
+
+      // Group by current drill level
+      const field = drillHierarchy[level];
+      const groups = rows.reduce((acc, item) => {
+        const key = item[field] || '(blank)';
+        (acc[key] = acc[key] || []).push(item);
+        return acc;
+      }, {});
+
+      return Object.entries(groups).map(([val, items]) => {
+        // Aggregate metrics for this group
+        const aggregated = items.reduce((sum, item) => {
+          availableMetrics.forEach(col => {
+            sum[col] = (sum[col] || 0) + (item[col] || 0);
+          });
+          return sum;
+        }, {});
+
+        // Compute derived columns
+        finalComputedColumns.forEach(computedCol => {
+          aggregated[computedCol.key] = computeValue(computedCol, aggregated);
+        });
+
+        const key = `${parentKey}-${field}-${val}`;
+        return {
+          ...aggregated,
+          [field]: val,
+          level,
+          key,
+          isLeaf: false,
+          children: buildNested(items, level + 1, key, { ...parentVals, [field]: val }),
+        };
+      });
+    },
+    [drillHierarchy, availableMetrics, finalComputedColumns, leafGroupBy]
+  );
+
+  // Flatten nested structure for display
+  const flatten = React.useCallback((nodes, expanded, out = []) => {
+    nodes.forEach(node => {
+      out.push(node);
+      if (!node.isLeaf && expanded.has(node.key)) {
+        flatten(node.children, expanded, out);
+      }
+    });
+    return out;
+  }, []);
+
+  const nested = React.useMemo(() => buildNested(data), [data, buildNested]);
+  const [expanded, setExpanded] = React.useState(new Set());
+  const flat = React.useMemo(() => flatten(nested, expanded), [nested, expanded, flatten]);
+
+  const toggle = (key) => {
+    const newExpanded = new Set(expanded);
+    newExpanded.has(key) ? newExpanded.delete(key) : newExpanded.add(key);
+    setExpanded(newExpanded);
+  };
+
+  // Get only the explicitly provided computed columns (not auto-computed ones)
+  const explicitComputedColumns = finalComputedColumns.filter(col => !col.isAutoComputed);
+
+  // Helper to organize ALL columns (metrics + computed) in specified order
+  const organizedColumns = React.useMemo(() => {
+    // Combine all data columns (metrics + computed)
+    const allMetricColumns = availableMetrics;
+    const allComputedColumns = explicitComputedColumns;
+    const allDataColumns = [...allMetricColumns, ...allComputedColumns.map(col => col.key)];
+
+    if (columnOrder.length === 0) {
+      // No custom order specified, return default order
+      return [...allMetricColumns, ...allComputedColumns];
+    }
+
+    // Filter columnOrder to only include columns that actually exist in data
+    const validOrderedColumns = columnOrder.filter(col => allDataColumns.includes(col));
+
+    // Create ordered array of column objects
+    const ordered = validOrderedColumns.map(colKey => {
+      // Check if it's a metric column
+      if (allMetricColumns.includes(colKey)) {
+        return { key: colKey, type: 'metric' };
+      }
+      // Check if it's a computed column
+      const computedCol = allComputedColumns.find(col => col.key === colKey);
+      if (computedCol) {
+        return { ...computedCol, type: 'computed' };
+      }
+      return null;
+    }).filter(Boolean);
+
+    // Add any remaining columns that weren't specified in columnOrder
+    const remainingMetrics = allMetricColumns
+      .filter(col => !validOrderedColumns.includes(col))
+      .map(col => ({ key: col, type: 'metric' }));
+
+    const remainingComputed = allComputedColumns
+      .filter(col => !validOrderedColumns.includes(col.key))
+      .map(col => ({ ...col, type: 'computed' }));
+
+    return [...ordered, ...remainingMetrics, ...remainingComputed];
+  }, [availableMetrics, explicitComputedColumns, columnOrder]);
+
+  return (
+    <div className="p-6 bg-gray-50 min-h-screen">
+      <div className="overflow-x-auto bg-white border border-slate-300 rounded-lg">
+        <table className="w-full table-auto">
+          <thead className="bg-slate-50 border-b">
+            <tr>
+              {drillHierarchy.map(col => (
+                <th
+                  key={col}
+                  className="px-4 py-3 text-left text-md font-semibold text-slate-700 uppercase"
+                >
+                  {labelFor(col)}
+                </th>
+              ))}
+              {leafGroupBy && (
+                <th className="px-4 py-3 text-left text-md font-semibold text-slate-700 uppercase">
+                  {labelFor(leafGroupBy)}
+                </th>
+              )}
+              {organizedColumns.map(col => (
+                <th
+                  key={col.key}
+                  className={`px-4 py-3 text-right text-md font-semibold text-slate-700 uppercase ${shouldShowGrandTotal(col.key) ? 'bg-blue-50' : ''
+                    }`}
+                >
+                  {col.type === 'computed' ? col.label || labelFor(col.key) : labelFor(col.key)}
+                  {shouldShowGrandTotal(col.key) && (
+                    <span className="ml-1 text-xs text-blue-600"></span>
+                  )}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {flat.map(item => (
+              <tr key={item.key} className="hover:bg-gray-50">
+                {drillHierarchy.map((col, idx) => (
+                  <td
+                    key={col}
+                    className="px-4 py-2"
+                    style={{ paddingLeft: `${item.level * 20}px` }}
+                  >
+                    {item.level === idx && (
+                      <div className="flex items-center gap-2">
+                        <span className="w-5 h-5 inline-block">
+                          {!item.isLeaf ? (
+                            <button
+                              onClick={() => toggle(item.key)}
+                              className="w-5 h-5 flex items-center justify-center p-0 hover:bg-gray-200 rounded"
+                            >
+                              <span
+                                className={`inline-block transform transition-transform duration-200 ${expanded.has(item.key) ? 'rotate-90' : ''
+                                  }`}
+                              >
+                                {icon?.arrow || '▶'}
+                              </span>
+                            </button>
+                          ) : (
+                            <span className="block text-gray-400 text-center">•</span>
+                          )}
+                        </span>
+                        {item[col] != null && (
+                          <Pill level={item.level} pillStyles={pillStyles}>
+                            {item[col]}
+                          </Pill>
+                        )}
+                      </div>
+                    )}
+                  </td>
+                ))}
+                {leafGroupBy && (
+                  <td className="px-4 py-2">
+                    {item[leafGroupBy] && (
+                      <Pill level={item.level} pillStyles={pillStyles}>
+                        {item[leafGroupBy]}
+                      </Pill>
+                    )}
+                  </td>
+                )}
+                {organizedColumns.map(col => (
+                  <td key={col.key} className="px-4 py-2 text-right">
+                    {col.key === scoreColumn
+                      ? (item.isLeaf
+                        ? formatValue(item[col.key], col.key, item)
+                        : null
+                      )
+                      : formatValue(item[col.key], col.key, item)
+                    }
+                  </td>
+
+                ))}
+
+
+              </tr>
+            ))}
+            {/* Grand Total Row - Only show if enabled */}
+            {showGrandTotal && (
+              <tr className="bg-blue-50 font-semibold border-t-2">
+                <td
+                  colSpan={drillHierarchy.length + (leafGroupBy ? 1 : 0)}
+                  className="px-4 py-3"
+                >
+                  Grand Total
+                </td>
+                {organizedColumns.map(col => {
+                  if (!shouldShowGrandTotal(col.key)) {
+                    return (
+                      <td key={col.key} className="px-4 py-3 text-right">
+                        <span className="text-gray-400"></span>
+                      </td>
+                    );
+                  }
+
+                  if (col.type === 'computed') {
+                    const totalRow = data.reduce((sum, row) => {
+                      availableMetrics.forEach(metric => {
+                        sum[metric] = (sum[metric] || 0) + (row[metric] || 0);
+                      });
+                      return sum;
+                    }, {});
+                    return (
+                      <td key={col.key} className="px-4 py-3 text-right">
+                        {formatValue(computeValue(col, totalRow), col.key)}
+                      </td>
+                    );
+                  } else {
+                    // Metric column
+                    return (
+                      <td key={col.key} className="px-4 py-3 text-right">
+                        {formatValue(
+                          data.reduce((sum, row) => sum + (row[col.key] || 0), 0),
+                          col.key
+                        )}
+
+                      </td>
+                    );
+                  }
+                })}
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// Main App component
+export default function App(props) {
+  // Get sample data and remove duplicates
+  const Data = Object.values(props.data).flat();
+  const sampleData = Data.filter(item =>
+    item.transaction_date?.startsWith('2025-05')
+  );
+
+  console.log(sampleData);
+
+  return (
+    <GeneralizedDrillDownTable
+      data={sampleData}
+      drillHierarchy={['zonal_sales_head_name', 'rsm_name']}
+      leafGroupBy="asm_name"
+      metricColumns={[
+        'sum_of_secondary_sales',
+        'sum_of_sfa_billed_value',
+       
+        'score'
+      ]}
+      computedColumns={[
+        {
+          key: 'percent_sfa_billing',
+          label: 'percent_sfa_billing',
+          formula: 'sum_of_secondary_sales/sum_of_sfa_billed_value'
+        },
+        {
+          key: 'score',
+          label: 'Score',
+          // formula as a function: input is the aggregated row
+          formula: row => {
+            const pct = row.percent_sfa_billing || 0; // Use the custom scoreColumn prop
+
+            if (pct * 10 >= 90) return 10;
+            else if (pct * 10 >= 80) return 9;
+            else if (pct * 10 >= 70) return 8;
+            else if (pct * 10 >= 60) return 7;
+            else if (pct * 10 >= 50) return 6;
+            else if (pct * 10 >= 40) return 5;
+            else if (pct * 10 >= 30) return 4;
+            else if (pct * 10 >= 20) return 3;
+            else if (pct * 10 >= 10) return 2;
+            else if (pct * 10 > 0) return 1;
+            else return 0;
+          }
+        },
+
+      ]}
+      autoComputeColumns={true}
+      // NEW: Specify which columns should show grand totals
+      grandTotalColumns={['sum_of_secondary_sales', 'sum_of_sfa_billed_value']} // Only these will show totals
+      showGrandTotal={true} // Set to false to hide grand total row entirely
+      // NEW: Specify the order of columns (left to right after hierarchy columns)
+      columnOrder={[  'sum_of_secondary_sales',
+  'sum_of_sfa_billed_value',
+  'percent_sfa_billing',
+   'score',]}
+      // NEW: Specify which column to base the main score on (you can change this to any column)
+      scoreColumn="score" // Change this to your custom column name
+      pillStyles={{
+        0: 'border-red-600 bg-red-100 text-red-800',
+        1: 'border-green-600 bg-green-100 text-green-800',
+        2: 'border-blue-600 bg-blue-100 text-blue-800',
+      }}
+      icon={{
+        arrow: (
+          <svg
+            className="w-5 h-5"
+            viewBox="0 0 24 24"
+            fill="none"
+            xmlns="http://www.w3.org/2000/svg"
+          >
+            <path
+              d="M9 18L15 12L9 6"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+        ),
+      }}
+      columnLabels={{
+        sum_of_secondary_sales: 'Secondary Sales (₹)',
+        sum_of_sfa_billed_value: 'SFA Billed Value (₹)',
+        percent_sfa_billing: 'SFA Billing (%)',
+        monthly_ach: 'Monthly Achievement (%)',
+        score: 'Score',
+        cov_prod_result: 'Cov Res',
+
+      }}
+
+      formatters={{
+         percent_sfa_billing: (val) => `${val?.toFixed(1) * 10}%`, // Ratio format
+
+        score: (val) => `${val} pts`, // Points format for the main score
+        sum_of_sfa_billed_value: (val) => val?.toLocaleString(),
+       sum_of_secondary_sales: (val) => val?.toLocaleString(),
+        // cov_prod_result: (val) => `${val?.toFixed(1)}`, // Percentage format
+        // Points format for the cov prod score
+      }}
+    />
+  );
+}
